@@ -1,9 +1,10 @@
-from pathlib import Path 
+from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, abort, g
+from flask_cors import CORS
 import mysql.connector
 from mysql.connector import Error as MySQLError
 import bcrypt
@@ -13,61 +14,97 @@ from functools import wraps
 import jwt
 import hashlib
 import secrets
+import stripe
+import re
 
 app = Flask(__name__)
 app.config["JSONIFY_PRETTYPRINT_REGULAR"] = False
+
+# ---------- CORS ----------
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://passwordmanager.tech").split(",")
+CORS(app, origins=ALLOWED_ORIGINS, supports_credentials=True)
+
+# ---------- Logging ----------
+logging.basicConfig(level=logging.INFO)
+app.logger.setLevel(logging.INFO)
 
 # ---------- Helpers / Env ----------
 
 def _require_env(name: str) -> str:
     val = os.getenv(name)
     if not val:
-        abort(500, description=f"Missing required environment variable: {name}")
+        raise RuntimeError(f"Missing required environment variable: {name}")
     return val
 
 def get_db_connection():
     return mysql.connector.connect(
-        host=_require_env("DB_HOST"),
+        host=os.getenv("DB_HOST", "localhost"),
         user=_require_env("DB_USER"),
         password=_require_env("DB_PASSWORD"),
         database=_require_env("DB_NAME"),
     )
 
-# ---------- JWT config ----------
+# ---------- JWT Config ----------
 
 JWT_SECRET = _require_env("JWT_SECRET")
 JWT_ALGO = os.getenv("JWT_ALGO", "HS256")
 JWT_EXP_MINUTES = int(os.getenv("JWT_EXP_MINUTES", "60"))
-
-JWT_ISSUER = os.getenv("JWT_ISSUER", "modloader-api")
-JWT_AUDIENCE = os.getenv("JWT_AUDIENCE", "modloader-clients")
-
-# MOD DOWNLOAD BASE URL
-MOD_BASE_URL = _require_env("MOD_BASE_URL")
+JWT_ISSUER = os.getenv("JWT_ISSUER", "passwordmanager-api")
+JWT_AUDIENCE = os.getenv("JWT_AUDIENCE", "passwordmanager-clients")
 
 # ---------- Refresh Token Config ----------
 REFRESH_EXP_DAYS = int(os.getenv("REFRESH_EXP_DAYS", "30"))
 
-BANNED_GROUP_IDS = {
-    int(x) for x in os.getenv("BANNED_GROUP_IDS", "7").split(",") if x.strip().isdigit()
-}
+# ---------- Stripe Config ----------
+STRIPE_SECRET_KEY = _require_env("STRIPE_SECRET_KEY")
+STRIPE_WEBHOOK_SECRET = _require_env("STRIPE_WEBHOOK_SECRET")
+STRIPE_PRICE_ID = _require_env("STRIPE_PRICE_ID")  # Your $19 one-time price ID
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://passwordmanager.tech")
 
-VIP_GROUP_IDS = {
-    int(x) for x in os.getenv("VIP_GROUP_IDS", "4").split(",") if x.strip().isdigit()
-}
+stripe.api_key = STRIPE_SECRET_KEY
 
-REQUIRE_VIP_FOR_LOGIN = os.getenv("REQUIRE_VIP_FOR_LOGIN", "1") == "1"
+# ---------- Download Config ----------
+DOWNLOAD_URL = os.getenv("DOWNLOAD_URL", "https://github.com/yourusername/repo/releases/latest/download/PasswordManager.zip")
 
+# ---------- Validation ----------
 
-# ---------- JWT helpers ----------
+def validate_username(username: str) -> tuple[bool, str]:
+    if not username:
+        return False, "Username is required"
+    if len(username) < 3:
+        return False, "Username must be at least 3 characters"
+    if len(username) > 50:
+        return False, "Username must be less than 50 characters"
+    if not re.match(r'^[a-zA-Z0-9_]+$', username):
+        return False, "Username can only contain letters, numbers, and underscores"
+    return True, ""
 
-def create_access_token(uid: int, username: str, is_vip: bool) -> str:
-    """Create a signed JWT for the user."""
+def validate_email(email: str) -> tuple[bool, str]:
+    if not email:
+        return False, "Email is required"
+    if len(email) > 255:
+        return False, "Email is too long"
+    if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
+        return False, "Invalid email format"
+    return True, ""
+
+def validate_password(password: str) -> tuple[bool, str]:
+    if not password:
+        return False, "Password is required"
+    if len(password) < 8:
+        return False, "Password must be at least 8 characters"
+    if len(password) > 128:
+        return False, "Password is too long"
+    return True, ""
+
+# ---------- JWT Helpers ----------
+
+def create_access_token(uid: int, username: str, has_purchased: bool) -> str:
     now = datetime.now(timezone.utc)
     payload = {
         "sub": str(uid),
         "username": username,
-        "vip": bool(is_vip),
+        "purchased": has_purchased,
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(minutes=JWT_EXP_MINUTES)).timestamp()),
         "iss": JWT_ISSUER,
@@ -78,14 +115,12 @@ def create_access_token(uid: int, username: str, is_vip: bool) -> str:
         token = token.decode("utf-8")
     return token
 
-
 def jwt_required(fn):
-    """Decorator to protect routes with JWT bearer token."""
     @wraps(fn)
     def wrapper(*args, **kwargs):
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer "):
-            abort(401, description="Missing or invalid Authorization header")
+            return jsonify(success=False, message="Missing or invalid Authorization header"), 401
 
         token = auth_header.split(" ", 1)[1].strip()
         try:
@@ -97,111 +132,45 @@ def jwt_required(fn):
                 issuer=JWT_ISSUER,
             )
         except jwt.ExpiredSignatureError:
-            abort(401, description="Token expired")
+            return jsonify(success=False, message="Token expired"), 401
         except jwt.InvalidTokenError:
-            abort(401, description="Invalid token")
+            return jsonify(success=False, message="Invalid token"), 401
 
         g.jwt_payload = payload
         g.current_uid = int(payload.get("sub", 0))
         g.current_username = payload.get("username")
-        g.current_is_vip = payload.get("vip", False)
+        g.current_has_purchased = payload.get("purchased", False)
 
         return fn(*args, **kwargs)
     return wrapper
 
-
 # ---------- Utility Helpers ----------
-
-def hash_hwid(hwid: str) -> str:
-    return hashlib.sha256(hwid.encode("utf-8")).hexdigest()
 
 def generate_refresh_token() -> tuple[str, str]:
     raw = secrets.token_hex(32)
     hashed = hashlib.sha256(raw.encode("utf-8")).hexdigest()
     return raw, hashed
 
-def parse_group_list(group_str: str | None) -> set[int]:
-    if not group_str:
-        return set()
-    return {
-        int(x)
-        for x in (g.strip() for g in group_str.split(","))
-        if x.isdigit()
-    }
+def generate_license_key() -> str:
+    """Generate a license key like XXXX-XXXX-XXXX-XXXX"""
+    segments = []
+    for _ in range(4):
+        segment = secrets.token_hex(2).upper()
+        segments.append(segment)
+    return "-".join(segments)
 
-
-def _get_user_and_groups(cur, uid: int):
-    """
-    Load usergroup + additionalgroups for this uid and return:
-    (user_row_dict, set_of_all_group_ids)
-
-    Returns (None, set()) if user not found.
-    """
+def check_user_purchased(cur, uid: int) -> bool:
     cur.execute(
         """
-        SELECT usergroup, additionalgroups
-        FROM myhcc_users
-        WHERE uid = %s
+        SELECT id FROM pm_purchases 
+        WHERE user_id = %s AND status = 'completed' 
         LIMIT 1
         """,
-        (uid,),
+        (uid,)
     )
-    row = cur.fetchone()
-    if not row:
-        return None, set()
+    return cur.fetchone() is not None
 
-    primary_group = int(row.get("usergroup") or 0)
-    additional_groups = parse_group_list(row.get("additionalgroups"))
-    all_groups = {primary_group} | additional_groups
-    return row, all_groups
-
-
-def _compute_allowed_mod_ids(cur, uid: int, all_groups: set[int]) -> set[int]:
-    """
-    Compute the set of mod_ids this user is allowed to use, based on
-    myhcc_mod_entitlements.
-
-    Rules:
-      - Any entry with allowed=0 is an explicit deny and overrides allows.
-      - At least one allowed=1 is required to grant access.
-      - If there are no entitlements, returns an empty set.
-    """
-    params = [uid]
-    entitlement_sql = """
-        SELECT mod_id, user_id, group_id, allowed
-        FROM myhcc_mod_entitlements
-        WHERE user_id = %s
-    """
-
-    if all_groups:
-        in_clause = ",".join(["%s"] * len(all_groups))
-        entitlement_sql += f" OR group_id IN ({in_clause})"
-        params.extend(list(all_groups))
-
-    cur.execute(entitlement_sql, params)
-    ent_rows = cur.fetchall()
-
-    allowed_mods = set()
-    denied_mods = set()
-
-    for row in ent_rows:
-        mod_id = int(row["mod_id"])
-        is_allowed = bool(row.get("allowed", 1))
-
-        if not is_allowed:
-            # explicit deny wins
-            denied_mods.add(mod_id)
-            if mod_id in allowed_mods:
-                allowed_mods.remove(mod_id)
-            continue
-
-        if mod_id not in denied_mods:
-            allowed_mods.add(mod_id)
-
-    return allowed_mods
-
-
-# ---------- Error handlers (always JSON) ----------
+# ---------- Error Handlers ----------
 
 @app.errorhandler(400)
 def _bad_request(e):
@@ -211,21 +180,26 @@ def _bad_request(e):
 def _unauth(e):
     return jsonify(success=False, message=str(e.description or "Unauthorized")), 401
 
+@app.errorhandler(403)
+def _forbidden(e):
+    return jsonify(success=False, message=str(e.description or "Forbidden")), 403
+
+@app.errorhandler(404)
+def _not_found(e):
+    return jsonify(success=False, message=str(e.description or "Not found")), 404
+
 @app.errorhandler(500)
 def _server_error(e):
     return jsonify(success=False, message="Server error"), 500
 
-
-app.logger.setLevel(logging.INFO)
-
-# ---------- Health checks ----------
+# ---------- Health Checks ----------
 
 @app.route("/api/ping")
 def ping():
     return jsonify(ok=True)
 
-@app.route("/api/dbcheck")
-def dbcheck():
+@app.route("/api/health")
+def health():
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -233,221 +207,22 @@ def dbcheck():
         cur.fetchone()
         cur.close()
         conn.close()
-        return jsonify(ok=True)
+        return jsonify(ok=True, db=True)
     except Exception as ex:
-        app.logger.exception("[DBCHECK] DB connectivity failed")
-        return jsonify(ok=False, error=str(ex)), 500
+        app.logger.exception("[HEALTH] DB check failed")
+        return jsonify(ok=False, db=False, error=str(ex)), 500
 
-
-# ---------- Mods (JWT-protected) ----------
-
-@app.route("/api/mods", methods=["GET"])
-@jwt_required
-def list_mods():
-    """
-    Return mods the current user is entitled to use for a given game.
-    Uses myhcc_mod_entitlements to determine allowed mod_ids.
-    """
-    game = (request.args.get("game") or "").strip().upper()
-    if not game:
-        abort(400, description="Missing game parameter")
-
-    uid = g.current_uid
-
-    conn = None
-    cur = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor(dictionary=True)
-
-        # 1) User + groups
-        user_row, all_groups = _get_user_and_groups(cur, uid)
-        if not user_row:
-            return jsonify(success=False, message="User not found"), 401
-
-        # 2) Allowed mod ids from entitlements
-        allowed_mods = _compute_allowed_mod_ids(cur, uid, all_groups)
-        if not allowed_mods:
-            # No entitlements -> no mods
-            return jsonify(success=True, mods=[]), 200
-
-        mod_id_list = sorted(allowed_mods)
-        in_clause = ",".join(["%s"] * len(mod_id_list))
-        params = [game] + mod_id_list
-
-        # 3) Actually load mod metadata
-        cur.execute(
-            f"""
-            SELECT id, game, name, internal_name, version, file_path, sha256
-            FROM myhcc_mods
-            WHERE game = %s
-              AND is_active = 1
-              AND id IN ({in_clause})
-            ORDER BY name ASC
-            """,
-            params,
-        )
-        rows = cur.fetchall()
-
-        mods = []
-        for r in rows:
-            download_url = f"{MOD_BASE_URL}/{r['file_path']}"
-            mods.append({
-                "id": r["id"],
-                "game": r["game"],
-                "name": r["name"],
-                "internal_name": r["internal_name"],
-                "version": r["version"],
-                "download_url": download_url,
-                "sha256": r["sha256"],
-            })
-
-        return jsonify(success=True, mods=mods), 200
-
-    except Exception:
-        app.logger.exception("[MODS] Unhandled error (with entitlements)")
-        return jsonify(success=False, message="Server error"), 500
-    finally:
-        if cur:
-            cur.close()
-        if conn:
-            conn.close()
-
-
-@app.route("/api/mods/download/<mod_key>", methods=["GET"])
-@jwt_required
-def download_mod(mod_key: str):
-    """
-    Download endpoint with entitlement + logging.
-
-    - mod_key can be:
-        * numeric -> myhcc_mods.id
-        * non-numeric -> myhcc_mods.internal_name
-    - Requires ?hwid=... query parameter.
-    """
-    hwid = (request.args.get("hwid") or "").strip()
-    if not hwid:
-        return jsonify(success=False, message="Missing hwid parameter"), 400
-
-    uid = g.current_uid
-    hwid_hash = hash_hwid(hwid)
-    is_numeric_id = mod_key.isdigit()
-
-    conn = None
-    cur = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor(dictionary=True)
-
-        # 1) User + groups
-        user_row, all_groups = _get_user_and_groups(cur, uid)
-        if not user_row:
-            return jsonify(success=False, message="User not found"), 401
-
-        # 2) Allowed mod ids for this user
-        allowed_mods = _compute_allowed_mod_ids(cur, uid, all_groups)
-
-        # 3) Load the mod row by id or internal_name
-        if is_numeric_id:
-            cur.execute(
-                """
-                SELECT id, game, name, internal_name, version, file_path, sha256, is_active
-                FROM myhcc_mods
-                WHERE id = %s
-                LIMIT 1
-                """,
-                (int(mod_key),),
-            )
-        else:
-            cur.execute(
-                """
-                SELECT id, game, name, internal_name, version, file_path, sha256, is_active
-                FROM myhcc_mods
-                WHERE internal_name = %s
-                LIMIT 1
-                """,
-                (mod_key,),
-            )
-
-        mod = cur.fetchone()
-        if not mod:
-            return jsonify(success=False, message="Mod not found"), 404
-
-        mod_id = int(mod["id"])
-
-        # 4) Check entitlements via allowed_mods set
-        if mod_id not in allowed_mods or not mod.get("is_active"):
-            ip_address = request.headers.get("X-Forwarded-For", request.remote_addr)
-            user_agent = request.headers.get("User-Agent", "")[:255]
-
-            cur.execute(
-                """
-                INSERT INTO myhcc_download_log
-                    (user_id, mod_id, hwid_hash,
-                     ip_address, user_agent, status, downloaded_at)
-                VALUES (%s, %s, %s, %s, %s, 'blocked', NOW())
-                """,
-                (uid, mod_id, hwid_hash, ip_address, user_agent),
-            )
-            conn.commit()
-
-            return jsonify(success=False, message="Not entitled or mod inactive"), 403
-
-        # 5) Log successful download attempt
-        ip_address = request.headers.get("X-Forwarded-For", request.remote_addr)
-        user_agent = request.headers.get("User-Agent", "")[:255]
-
-        cur.execute(
-            """
-            INSERT INTO myhcc_download_log
-                (user_id, mod_id, hwid_hash,
-                 ip_address, user_agent, status, downloaded_at)
-            VALUES (%s, %s, %s, %s, %s, 'success', NOW())
-            """,
-            (uid, mod_id, hwid_hash, ip_address, user_agent),
-        )
-        conn.commit()
-
-        # 6) Return download info
-        download_url = f"{MOD_BASE_URL}/{mod['file_path']}"
-
-        return jsonify(
-            success=True,
-            mod={
-                "id": mod["id"],
-                "game": mod["game"],
-                "name": mod["name"],
-                "internal_name": mod["internal_name"],
-                "version": mod["version"],
-                "download_url": download_url,
-                "sha256": mod["sha256"],
-            }
-        ), 200
-
-    except MySQLError:
-        app.logger.exception("[MODS_DOWNLOAD] MySQL error")
-        return jsonify(success=False, message="Service unavailable"), 503
-    except Exception:
-        app.logger.exception("[MODS_DOWNLOAD] Unhandled server error")
-        return jsonify(success=False, message="Server error"), 500
-    finally:
-        if cur:
-            cur.close()
-        if conn:
-            conn.close()
-
-
-# ---------- AUTH LOGIN (MAIN LOADER LOGIN ENDPOINT) ----------
+# ---------- AUTH: LOGIN (HttpOnly refresh cookie) ----------
 
 @app.route("/api/auth/login", methods=["POST"])
 def auth_login():
     data = request.get_json(silent=True) or {}
-    username = (data.get("username") or "").strip()
-    password = (data.get("password") or "")
-    hwid = (data.get("hwid") or "").strip()
 
-    if not username or not password or not hwid:
-        return jsonify(success=False, message="Missing username, password, or hwid"), 400
+    username_or_email = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+
+    if not username_or_email or not password:
+        return jsonify(success=False, message="Username and password required"), 400
 
     conn = None
     cur = None
@@ -455,130 +230,85 @@ def auth_login():
         conn = get_db_connection()
         cur = conn.cursor(dictionary=True)
 
-        # 1) Load user from MyBB users table (bcrypt hashed)
         cur.execute(
             """
-            SELECT
-                uid,
-                username,
-                password,
-                usergroup,
-                additionalgroups,
-                ougc_invite_system_banned
-            FROM myhcc_users
-            WHERE username = %s
+            SELECT uid, username, email, password, is_active
+            FROM pm_users
+            WHERE username = %s OR email = %s
             LIMIT 1
             """,
-            (username,),
+            (username_or_email, username_or_email.lower())
         )
         user = cur.fetchone()
 
         if not user:
             return jsonify(success=False, message="Invalid username or password"), 401
+        if not user.get("is_active"):
+            return jsonify(success=False, message="Account is disabled"), 403
+
+        stored_hash = user.get("password") or ""
+        if isinstance(stored_hash, str):
+            stored_hash = stored_hash.encode("utf-8")
+
+        try:
+            if not bcrypt.checkpw(password.encode("utf-8"), stored_hash):
+                return jsonify(success=False, message="Invalid username or password"), 401
+        except Exception:
+            app.logger.exception("[LOGIN] bcrypt error")
+            return jsonify(success=False, message="Invalid username or password"), 401
 
         uid = int(user["uid"])
-        stored_hash = user.get("password")
+        has_purchased = check_user_purchased(cur, uid)
 
-        if stored_hash is None:
-            app.logger.warning("[AUTH_LOGIN] Stored hash is NULL for username=%s", username)
-            return jsonify(success=False, message="Invalid username or password"), 401
-
-        # Make sure stored hash is bytes
-        if isinstance(stored_hash, str):
-            stored_hash_bytes = stored_hash.encode("utf-8")
-        else:
-            stored_hash_bytes = stored_hash
-
-        # 2) Verify bcrypt password
-        try:
-            ok = bcrypt.checkpw(password.encode("utf-8"), stored_hash_bytes)
-        except Exception:
-            app.logger.exception("[AUTH_LOGIN] bcrypt failure for username=%s", username)
-            return jsonify(success=False, message="Invalid username or password"), 401
-
-        if not ok:
-            return jsonify(success=False, message="Invalid username or password"), 401
-
-        # 3) Check VIP/banned
-        usergroup = int(user.get("usergroup") or 0)
-        additionalgroups = parse_group_list(user.get("additionalgroups"))
-        all_groups = {usergroup} | additionalgroups
-
-        is_banned_flag = bool(user.get("ougc_invite_system_banned"))
-        is_banned_group = any(g in BANNED_GROUP_IDS for g in all_groups)
-        is_vip = any(g in VIP_GROUP_IDS for g in all_groups)
-
-        if is_banned_flag or is_banned_group:
-            return jsonify(success=False, message="Account banned"), 403
-
-        if REQUIRE_VIP_FOR_LOGIN and not is_vip:
-            return jsonify(success=False, message="Account not invited/VIP"), 403
-
-        # 4) HWID hash
-        hwid_hash = hash_hwid(hwid)
-
-        # 5) Enforce single-HWID: revoke old tokens with different HWID
-        cur.execute(
-            """
-            SELECT id, hwid_hash
-            FROM myhcc_auth_refresh_tokens
-            WHERE user_id = %s
-              AND revoked_at IS NULL
-            """,
-            (uid,),
-        )
-        existing_tokens = cur.fetchall()
-
-        for row in existing_tokens:
-            if row["hwid_hash"] != hwid_hash:
-                cur.execute(
-                    """
-                    UPDATE myhcc_auth_refresh_tokens
-                    SET revoked_at = NOW(), reason = 'hwid_mismatch'
-                    WHERE id = %s
-                    """,
-                    (row["id"],),
-                )
-
-        # 6) Create & store new refresh token
+        # create refresh token (raw + sha256 hash)
         raw_refresh, hashed_refresh = generate_refresh_token()
         expires_at = datetime.now(timezone.utc) + timedelta(days=REFRESH_EXP_DAYS)
 
         ip_address = request.headers.get("X-Forwarded-For", request.remote_addr)
-        user_agent = request.headers.get("User-Agent", "")[:255]
+        user_agent = (request.headers.get("User-Agent") or "")[:255]
 
         cur.execute(
             """
-            INSERT INTO myhcc_auth_refresh_tokens
-                (user_id, refresh_token_hash, hwid_hash,
-                 created_at, expires_at,
-                 ip_address, user_agent, reason)
-            VALUES (%s, %s, %s, NOW(), %s, %s, %s, 'login')
+            INSERT INTO pm_refresh_tokens
+                (user_id, refresh_token_hash, expires_at, ip_address, user_agent, created_at)
+            VALUES (%s, %s, %s, %s, %s, NOW())
             """,
-            (uid, hashed_refresh, hwid_hash, expires_at, ip_address, user_agent),
+            (uid, hashed_refresh, expires_at, ip_address, user_agent)
         )
-
         conn.commit()
 
-        # 7) Issue access token JWT
-        access_token = create_access_token(uid=uid, username=user["username"], is_vip=is_vip)
+        access_token = create_access_token(uid, user["username"], has_purchased)
 
-        return jsonify(
+        resp = jsonify(
             success=True,
             uid=uid,
             username=user["username"],
-            is_vip=is_vip,
+            email=user["email"],
+            has_purchased=has_purchased,
             access_token=access_token,
             access_expires_in=JWT_EXP_MINUTES * 60,
-            refresh_token=raw_refresh,
             refresh_expires_in=REFRESH_EXP_DAYS * 86400,
-        ), 200
+        )
+
+        # IMPORTANT: passwordmanager.tech -> api.passwordmanager.tech is cross-site
+        # Browsers require SameSite=None + Secure for cookies to be sent.
+        resp.set_cookie(
+            "pm_refresh",
+            raw_refresh,
+            httponly=True,
+            secure=True,
+            samesite="None",
+            max_age=REFRESH_EXP_DAYS * 86400,
+            path="/api/auth",   # cookie only sent to /api/auth/*
+        )
+
+        return resp, 200
 
     except MySQLError:
-        app.logger.exception("[AUTH_LOGIN] MySQL error")
+        app.logger.exception("[LOGIN] MySQL error")
         return jsonify(success=False, message="Service unavailable"), 503
     except Exception:
-        app.logger.exception("[AUTH_LOGIN] Unhandled server error")
+        app.logger.exception("[LOGIN] Unhandled error")
         return jsonify(success=False, message="Server error"), 500
     finally:
         if cur:
@@ -586,19 +316,32 @@ def auth_login():
         if conn:
             conn.close()
 
-# ---------- AUTH REFRESH  ----------
+# ---------- AUTH: REGISTER ----------
 
-@app.route("/api/auth/refresh", methods=["POST"])
-def auth_refresh():
+@app.route("/api/auth/register", methods=["POST"])
+def auth_register():
     data = request.get_json(silent=True) or {}
-    raw_refresh = (data.get("refresh_token") or "").strip()
-    hwid = (data.get("hwid") or "").strip()
 
-    if not raw_refresh or not hwid:
-        return jsonify(success=False, message="Missing refresh_token or hwid"), 400
+    username = (data.get("username") or "").strip()
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+    password2 = data.get("password2") or ""
 
-    hashed_refresh = hashlib.sha256(raw_refresh.encode("utf-8")).hexdigest()
-    hwid_hash = hash_hwid(hwid)
+    # Validate inputs
+    valid, msg = validate_username(username)
+    if not valid:
+        return jsonify(success=False, message=msg), 400
+
+    valid, msg = validate_email(email)
+    if not valid:
+        return jsonify(success=False, message=msg), 400
+
+    valid, msg = validate_password(password)
+    if not valid:
+        return jsonify(success=False, message=msg), 400
+
+    if password != password2:
+        return jsonify(success=False, message="Passwords do not match"), 400
 
     conn = None
     cur = None
@@ -606,150 +349,39 @@ def auth_refresh():
         conn = get_db_connection()
         cur = conn.cursor(dictionary=True)
 
-        # 1) Find refresh token row + join user
+        # Check if username exists
+        cur.execute("SELECT uid FROM pm_users WHERE username = %s LIMIT 1", (username,))
+        if cur.fetchone():
+            return jsonify(success=False, message="Username already taken"), 409
+
+        # Check if email exists
+        cur.execute("SELECT uid FROM pm_users WHERE email = %s LIMIT 1", (email,))
+        if cur.fetchone():
+            return jsonify(success=False, message="Email already registered"), 409
+
+        # Hash password
+        password_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+        # Insert user
         cur.execute(
             """
-            SELECT
-                t.id,
-                t.user_id,
-                t.hwid_hash,
-                t.expires_at,
-                t.revoked_at,
-                u.username,
-                u.usergroup,
-                u.additionalgroups,
-                u.ougc_invite_system_banned
-            FROM myhcc_auth_refresh_tokens AS t
-            JOIN myhcc_users AS u
-              ON u.uid = t.user_id
-            WHERE t.refresh_token_hash = %s
-            LIMIT 1
+            INSERT INTO pm_users (username, email, password, is_active, is_verified, created_at)
+            VALUES (%s, %s, %s, 1, 0, NOW())
             """,
-            (hashed_refresh,),
+            (username, email, password_hash)
         )
-        row = cur.fetchone()
-
-        if not row:
-            # Unknown token
-            return jsonify(success=False, message="Invalid refresh token"), 401
-
-        token_id = int(row["id"])
-        uid = int(row["user_id"])
-        db_hwid_hash = row["hwid_hash"]
-        expires_at = row["expires_at"]
-        revoked_at = row["revoked_at"]
-
-        # 2) Basic validity checks
-        now = datetime.now(timezone.utc)
-
-        if revoked_at is not None:
-            return jsonify(success=False, message="Refresh token revoked"), 401
-
-        if isinstance(expires_at, datetime):
-            # If DB stores naive datetimes, you may want to treat them as UTC
-            if expires_at.replace(tzinfo=timezone.utc) <= now:
-                return jsonify(success=False, message="Refresh token expired"), 401
-
-        if db_hwid_hash != hwid_hash:
-            # HWID mismatch -> revoke token
-            cur.execute(
-                """
-                UPDATE myhcc_auth_refresh_tokens
-                SET revoked_at = NOW(), reason = 'hwid_mismatch_refresh'
-                WHERE id = %s
-                """,
-                (token_id,),
-            )
-            conn.commit()
-            return jsonify(success=False, message="Invalid refresh token"), 401
-
-        # 3) Re-check VIP / banned status from MyBB groups
-        usergroup = int(row.get("usergroup") or 0)
-        additionalgroups = parse_group_list(row.get("additionalgroups"))
-        all_groups = {usergroup} | additionalgroups
-
-        is_banned_flag = bool(row.get("ougc_invite_system_banned"))
-        is_banned_group = any(g in BANNED_GROUP_IDS for g in all_groups)
-        is_vip = any(g in VIP_GROUP_IDS for g in all_groups)
-
-        if is_banned_flag or is_banned_group:
-            # Kill this token as well
-            cur.execute(
-                """
-                UPDATE myhcc_auth_refresh_tokens
-                SET revoked_at = NOW(), reason = 'banned_on_refresh'
-                WHERE id = %s
-                """,
-                (token_id,),
-            )
-            conn.commit()
-            return jsonify(success=False, message="Account banned"), 403
-
-        if REQUIRE_VIP_FOR_LOGIN and not is_vip:
-            cur.execute(
-                """
-                UPDATE myhcc_auth_refresh_tokens
-                SET revoked_at = NOW(), reason = 'lost_vip_on_refresh'
-                WHERE id = %s
-                """,
-                (token_id,),
-            )
-            conn.commit()
-            return jsonify(success=False, message="Account not invited/VIP"), 403
-
-        # 4) Rotate refresh token: revoke old, insert new
-        new_raw_refresh, new_hashed_refresh = generate_refresh_token()
-        new_expires_at = now + timedelta(days=REFRESH_EXP_DAYS)
-
-        ip_address = request.headers.get("X-Forwarded-For", request.remote_addr)
-        user_agent = request.headers.get("User-Agent", "")[:255]
-
-        # Revoke old one as "rotated"
-        cur.execute(
-            """
-            UPDATE myhcc_auth_refresh_tokens
-            SET revoked_at = NOW(), reason = 'rotated'
-            WHERE id = %s
-            """,
-            (token_id,),
-        )
-
-        # Insert new one
-        cur.execute(
-            """
-            INSERT INTO myhcc_auth_refresh_tokens
-                (user_id, refresh_token_hash, hwid_hash,
-                 created_at, expires_at, ip_address, user_agent, reason)
-            VALUES (%s, %s, %s, NOW(), %s, %s, %s, 'refresh')
-            """,
-            (uid, new_hashed_refresh, hwid_hash, new_expires_at, ip_address, user_agent),
-        )
-
         conn.commit()
 
-        # 5) Issue new access token
-        access_token = create_access_token(
-            uid=uid,
-            username=row["username"],
-            is_vip=is_vip,
-        )
+        uid = cur.lastrowid
+        app.logger.info(f"[REGISTER] New user registered: {username} (uid={uid})")
 
-        return jsonify(
-            success=True,
-            uid=uid,
-            username=row["username"],
-            is_vip=is_vip,
-            access_token=access_token,
-            access_expires_in=JWT_EXP_MINUTES * 60,
-            refresh_token=new_raw_refresh,
-            refresh_expires_in=REFRESH_EXP_DAYS * 86400,
-        ), 200
+        return jsonify(success=True, message="Account created successfully", uid=uid), 201
 
     except MySQLError:
-        app.logger.exception("[AUTH_REFRESH] MySQL error")
+        app.logger.exception("[REGISTER] MySQL error")
         return jsonify(success=False, message="Service unavailable"), 503
     except Exception:
-        app.logger.exception("[AUTH_REFRESH] Unhandled server error")
+        app.logger.exception("[REGISTER] Unhandled error")
         return jsonify(success=False, message="Server error"), 500
     finally:
         if cur:
@@ -757,17 +389,226 @@ def auth_refresh():
         if conn:
             conn.close()
 
-# ---------- Example protected endpoint ----------
 
-@app.route("/api/me", methods=["GET"])
+# ---------- AUTH: REFRESH (HttpOnly cookie flow) ----------
+
+@app.route("/api/auth/refresh", methods=["POST"])
+def auth_refresh():
+    raw_refresh = (request.cookies.get("pm_refresh") or "").strip()
+    if not raw_refresh:
+        return jsonify(success=False, message="Refresh token required"), 400
+
+    hashed_refresh = hashlib.sha256(raw_refresh.encode("utf-8")).hexdigest()
+
+    conn = None
+    cur = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(dictionary=True)
+
+        cur.execute(
+            """
+            SELECT t.id, t.user_id, t.expires_at, t.revoked_at,
+                   u.username, u.email, u.is_active
+            FROM pm_refresh_tokens t
+            JOIN pm_users u ON u.uid = t.user_id
+            WHERE t.refresh_token_hash = %s
+            LIMIT 1
+            """,
+            (hashed_refresh,)
+        )
+        row = cur.fetchone()
+
+        if not row:
+            resp = jsonify(success=False, message="Invalid refresh token")
+            resp.set_cookie("pm_refresh", "", expires=0, path="/api/auth",
+                            httponly=True, secure=True, samesite="None")
+            return resp, 401
+
+        if row["revoked_at"] is not None:
+            resp = jsonify(success=False, message="Refresh token revoked")
+            resp.set_cookie("pm_refresh", "", expires=0, path="/api/auth",
+                            httponly=True, secure=True, samesite="None")
+            return resp, 401
+
+        now = datetime.now(timezone.utc)
+        exp = row["expires_at"]
+        if isinstance(exp, datetime):
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
+            if exp <= now:
+                resp = jsonify(success=False, message="Refresh token expired")
+                resp.set_cookie("pm_refresh", "", expires=0, path="/api/auth",
+                                httponly=True, secure=True, samesite="None")
+                return resp, 401
+
+        if not row.get("is_active"):
+            resp = jsonify(success=False, message="Account is disabled")
+            resp.set_cookie("pm_refresh", "", expires=0, path="/api/auth",
+                            httponly=True, secure=True, samesite="None")
+            return resp, 403
+
+        uid = int(row["user_id"])
+        has_purchased = check_user_purchased(cur, uid)
+
+        # rotate refresh
+        new_raw, new_hash = generate_refresh_token()
+        new_expires = now + timedelta(days=REFRESH_EXP_DAYS)
+
+        ip_address = request.headers.get("X-Forwarded-For", request.remote_addr)
+        user_agent = (request.headers.get("User-Agent") or "")[:255]
+
+        cur.execute("UPDATE pm_refresh_tokens SET revoked_at = NOW() WHERE id = %s", (row["id"],))
+        cur.execute(
+            """
+            INSERT INTO pm_refresh_tokens
+                (user_id, refresh_token_hash, expires_at, ip_address, user_agent, created_at)
+            VALUES (%s, %s, %s, %s, %s, NOW())
+            """,
+            (uid, new_hash, new_expires, ip_address, user_agent)
+        )
+        conn.commit()
+
+        access_token = create_access_token(uid, row["username"], has_purchased)
+
+        resp = jsonify(
+            success=True,
+            uid=uid,
+            username=row["username"],
+            email=row["email"],
+            has_purchased=has_purchased,
+            access_token=access_token,
+            access_expires_in=JWT_EXP_MINUTES * 60,
+            refresh_expires_in=REFRESH_EXP_DAYS * 86400,
+        )
+
+        resp.set_cookie(
+            "pm_refresh",
+            new_raw,
+            httponly=True,
+            secure=True,
+            samesite="None",
+            max_age=REFRESH_EXP_DAYS * 86400,
+            path="/api/auth",
+        )
+
+        return resp, 200
+
+    except MySQLError:
+        app.logger.exception("[REFRESH] MySQL error")
+        return jsonify(success=False, message="Service unavailable"), 503
+    except Exception:
+        app.logger.exception("[REFRESH] Unhandled error")
+        return jsonify(success=False, message="Server error"), 500
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
+# ---------- AUTH: LOGOUT (cookie) ----------
+
+@app.route("/api/auth/logout", methods=["POST"])
 @jwt_required
-def me():
-    return jsonify(
-        success=True,
-        uid=g.current_uid,
-        username=g.current_username,
-        vip=g.current_is_vip,
-    ), 200
+def auth_logout():
+    raw_refresh = (request.cookies.get("pm_refresh") or "").strip()
+
+    resp = jsonify(success=True, message="Logged out")
+
+    # always clear cookie client-side
+    resp.set_cookie("pm_refresh", "", expires=0, path="/api/auth",
+                    httponly=True, secure=True, samesite="None")
+
+    if not raw_refresh:
+        return resp, 200
+
+    hashed = hashlib.sha256(raw_refresh.encode("utf-8")).hexdigest()
+
+    conn = None
+    cur = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE pm_refresh_tokens
+            SET revoked_at = NOW()
+            WHERE refresh_token_hash = %s AND user_id = %s
+            """,
+            (hashed, g.current_uid)
+        )
+        conn.commit()
+    except Exception:
+        app.logger.exception("[LOGOUT] Error (non-fatal)")
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
+    return resp, 200
+
+# ---------- USER: ME ----------
+
+@app.route("/api/user/me", methods=["GET"])
+@jwt_required
+def user_me():
+    conn = None
+    cur = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(dictionary=True)
+        
+        cur.execute(
+            """
+            SELECT uid, username, email, is_active, is_verified, created_at
+            FROM pm_users
+            WHERE uid = %s
+            """,
+            (g.current_uid,)
+        )
+        user = cur.fetchone()
+        
+        if not user:
+            return jsonify(success=False, message="User not found"), 404
+        
+        # Get purchase info
+        cur.execute(
+            """
+            SELECT id, license_key, status, created_at
+            FROM pm_purchases
+            WHERE user_id = %s AND status = 'completed'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (g.current_uid,)
+        )
+        purchase = cur.fetchone()
+        
+        return jsonify(
+            success=True,
+            user={
+                "uid": user["uid"],
+                "username": user["username"],
+                "email": user["email"],
+                "is_verified": bool(user["is_verified"]),
+                "created_at": user["created_at"].isoformat() if user["created_at"] else None,
+            },
+            purchase={
+                "has_purchased": purchase is not None,
+                "license_key": purchase["license_key"] if purchase else None,
+                "purchased_at": purchase["created_at"].isoformat() if purchase else None,
+            } if purchase else {"has_purchased": False}
+        ), 200
+        
+    except Exception:
+        app.logger.exception("[USER_ME] Error")
+        return jsonify(success=False, message="Server error"), 500
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
 
 # ---------- Password Manager Entitlements ----------
 
@@ -848,7 +689,201 @@ def pm_entitlements():
         if conn:
             conn.close()
 
-# ---------- Run App ----------
+
+# ---------- STRIPE: CREATE CHECKOUT ----------
+
+@app.route("/api/stripe/create-checkout", methods=["POST"])
+@jwt_required
+def stripe_create_checkout():
+    conn = None
+    cur = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(dictionary=True)
+        
+        # Check if already purchased
+        if check_user_purchased(cur, g.current_uid):
+            return jsonify(success=False, message="You already own this product"), 400
+        
+        # Get user email
+        cur.execute("SELECT email FROM pm_users WHERE uid = %s", (g.current_uid,))
+        user = cur.fetchone()
+        
+        if not user:
+            return jsonify(success=False, message="User not found"), 404
+        
+        # Create Stripe Checkout session
+        session = stripe.checkout.Session.create(
+            payment_method_types=["card"],
+            line_items=[{
+                "price": STRIPE_PRICE_ID,
+                "quantity": 1,
+            }],
+            mode="payment",
+            success_url=f"{FRONTEND_URL}?payment=success",
+            cancel_url=f"{FRONTEND_URL}?payment=cancelled",
+            customer_email=user["email"],
+            metadata={
+                "user_id": str(g.current_uid),
+                "username": g.current_username,
+            },
+            allow_promotion_codes=True,
+        )
+        
+        app.logger.info(f"[STRIPE] Checkout created for user {g.current_uid}: {session.id}")
+        
+        return jsonify(
+            success=True,
+            checkout_url=session.url,
+            session_id=session.id,
+        ), 200
+        
+    except stripe.error.StripeError as e:
+        app.logger.exception("[STRIPE] Stripe error")
+        return jsonify(success=False, message="Payment service error"), 500
+    except Exception:
+        app.logger.exception("[STRIPE] Unhandled error")
+        return jsonify(success=False, message="Server error"), 500
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
+# ---------- STRIPE: WEBHOOK ----------
+
+@app.route("/api/stripe/webhook", methods=["POST"])
+def stripe_webhook():
+    payload = request.get_data()
+    sig_header = request.headers.get("Stripe-Signature")
+    
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, STRIPE_WEBHOOK_SECRET
+        )
+    except ValueError:
+        app.logger.warning("[STRIPE_WEBHOOK] Invalid payload")
+        return jsonify(success=False), 400
+    except stripe.error.SignatureVerificationError:
+        app.logger.warning("[STRIPE_WEBHOOK] Invalid signature")
+        return jsonify(success=False), 400
+    
+    # Handle checkout.session.completed
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+        
+        user_id = session.get("metadata", {}).get("user_id")
+        if not user_id:
+            app.logger.warning("[STRIPE_WEBHOOK] No user_id in metadata")
+            return jsonify(success=True), 200
+        
+        user_id = int(user_id)
+        payment_id = session.get("payment_intent")
+        customer_id = session.get("customer")
+        amount = session.get("amount_total", 0)
+        
+        conn = None
+        cur = None
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            
+            # Check if purchase already exists
+            cur.execute(
+                "SELECT id FROM pm_purchases WHERE stripe_payment_id = %s",
+                (payment_id,)
+            )
+            if cur.fetchone():
+                app.logger.info(f"[STRIPE_WEBHOOK] Purchase already exists for {payment_id}")
+                return jsonify(success=True), 200
+            
+            # Generate license key
+            license_key = generate_license_key()
+            
+            # Insert purchase
+            cur.execute(
+                """
+                INSERT INTO pm_purchases 
+                    (user_id, stripe_payment_id, stripe_customer_id, amount_cents, status, license_key, created_at)
+                VALUES (%s, %s, %s, %s, 'completed', %s, NOW())
+                """,
+                (user_id, payment_id, customer_id, amount, license_key)
+            )
+            conn.commit()
+            
+            app.logger.info(f"[STRIPE_WEBHOOK] Purchase recorded for user {user_id}, license: {license_key}")
+            
+        except Exception:
+            app.logger.exception("[STRIPE_WEBHOOK] DB error")
+        finally:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+    
+    return jsonify(success=True), 200
+
+# ---------- DOWNLOAD ----------
+
+@app.route("/api/download", methods=["GET"])
+@jwt_required
+def download():
+    conn = None
+    cur = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(dictionary=True)
+        
+        # Check purchase
+        cur.execute(
+            """
+            SELECT id, license_key FROM pm_purchases
+            WHERE user_id = %s AND status = 'completed'
+            LIMIT 1
+            """,
+            (g.current_uid,)
+        )
+        purchase = cur.fetchone()
+        
+        if not purchase:
+            return jsonify(success=False, message="Purchase required"), 403
+        
+        # Log download
+        ip_address = request.headers.get("X-Forwarded-For", request.remote_addr)
+        user_agent = (request.headers.get("User-Agent") or "")[:255]
+        
+        cur.execute(
+            """
+            INSERT INTO pm_download_logs (user_id, purchase_id, ip_address, user_agent, downloaded_at)
+            VALUES (%s, %s, %s, %s, NOW())
+            """,
+            (g.current_uid, purchase["id"], ip_address, user_agent)
+        )
+        conn.commit()
+        
+        app.logger.info(f"[DOWNLOAD] User {g.current_uid} downloaded product")
+        
+        return jsonify(
+            success=True,
+            download_url=DOWNLOAD_URL,
+            license_key=purchase["license_key"],
+        ), 200
+        
+    except Exception:
+        app.logger.exception("[DOWNLOAD] Error")
+        return jsonify(success=False, message="Server error"), 500
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
+# ---------- Run ----------
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=5000)
+
+
+
+
+
