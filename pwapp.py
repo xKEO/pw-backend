@@ -324,7 +324,7 @@ def auth_login():
 
         cur.execute(
             """
-            SELECT uid, username, email, password, is_active
+            SELECT uid, username, email, password_hash, is_active
             FROM pm_users
             WHERE username = %s OR email = %s
             LIMIT 1
@@ -338,7 +338,7 @@ def auth_login():
         if not user.get("is_active"):
             return jsonify(success=False, message="Account is disabled"), 403
 
-        stored_hash = user.get("password") or ""
+        stored_hash = user.get("password_hash") or ""
         if isinstance(stored_hash, str):
             stored_hash = stored_hash.encode("utf-8")
 
@@ -861,7 +861,7 @@ def auth_reset_password():
 
         # Update password
         password_hash = bcrypt.hashpw(new_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-        cur.execute("UPDATE pm_users SET password = %s WHERE uid = %s", (password_hash, reset["user_id"]))
+        cur.execute("UPDATE pm_users SET password_hash = %s WHERE uid = %s", (password_hash, reset["user_id"]))
 
         # Mark token as used
         cur.execute("UPDATE pm_password_resets SET used_at = NOW() WHERE id = %s", (reset["id"],))
