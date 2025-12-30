@@ -447,7 +447,7 @@ def auth_register():
 
         cur.execute(
             """
-            INSERT INTO pm_users (username, email, password, is_active, is_verified, created_at)
+            INSERT INTO pm_users (username, email, password_hash, is_active, is_verified, created_at)
             VALUES (%s, %s, %s, 1, 0, NOW())
             """,
             (username, email, password_hash)
@@ -2228,6 +2228,13 @@ from vault_sync_routes import register_vault_routes
 
 # Register all vault sync, key management, and sharing routes
 register_vault_routes(app, jwt_required, get_db_connection, app.logger)
+
+# ============================================================
+# ADMIN CONTROL PANEL
+# ============================================================
+
+from admin_routes import admin_bp
+app.register_blueprint(admin_bp)
 
 # ---------- Run ----------
 if __name__ == "__main__":
