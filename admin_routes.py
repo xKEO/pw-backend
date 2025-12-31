@@ -2,7 +2,7 @@
 Admin Control Panel Routes for Password Manager
 Uses SQLAlchemy with remote MySQL database on cPanel hosting
 """
-
+from urllib.parse import quote_plus
 from flask import Blueprint, request, jsonify, g
 from sqlalchemy import create_engine, text, func
 from sqlalchemy.orm import sessionmaker, scoped_session
@@ -23,14 +23,13 @@ admin_bp = Blueprint('admin', __name__, url_prefix='/api/admin')
 # ============================================================
 
 def get_db_url():
-    """Build MySQL connection URL from environment variables"""
     user = os.getenv("DB_USER")
     password = os.getenv("DB_PASSWORD")
     host = os.getenv("DB_HOST")
     database = os.getenv("DB_NAME")
     port = os.getenv("DB_PORT", "3306")
 
-    return f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}"
+    return f"mysql+pymysql://{user}:{quote_plus(password)}@{host}:{port}/{database}"
 
 # Create engine with connection pooling for remote database
 engine = create_engine(
