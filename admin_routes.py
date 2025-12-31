@@ -66,7 +66,7 @@ class RefreshToken(Base):
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     user_id = Column(BigInteger, nullable=False)
-    token_hash = Column(String(64), unique=True, nullable=False)
+    refresh_token_hash = Column(String(64), unique=True, nullable=False)
     ip_address = Column(String(45))
     user_agent = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
